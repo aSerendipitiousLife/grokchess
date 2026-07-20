@@ -642,11 +642,27 @@ function stopEnginePolling() {
   enginePollTimer = null;
 }
 
-function applyPlayState(next) {
+function sameBoardState(a, b) {
+  return a && b &&
+    a.fen === b.fen &&
+    a.last_move === b.last_move &&
+    a.status === b.status &&
+    Boolean(a.engine_pending) === Boolean(b.engine_pending) &&
+    (a.move_events ? a.move_events.length : 0) === (b.move_events ? b.move_events.length : 0);
+}
+
+function applyPlayState(next, options = {}) {
+  const visualUnchanged = sameBoardState(state, next);
   const priorEvents = renderedEvents;
   state = next;
   playState = next;
   renderedEvents = state.move_events.length;
+  if (options.skipUnchangedRender && visualUnchanged) {
+    renderPlayStatus();
+    if (state.engine_pending) scheduleEnginePoll();
+    else stopEnginePolling();
+    return;
+  }
   let animate = null;
   const newEvents = state.move_events.slice(priorEvents);
   const engineMove = newEvents.find(ev => ev.actor === "engine");
@@ -668,7 +684,7 @@ async function pollEngineReply() {
   enginePollTimer = null;
   if (!state || mode !== "play" || !state.engine_pending) return;
   try {
-    applyPlayState(await api(`/api/state/${state.game_id}`));
+    applyPlayState(await api(`/api/state/${state.game_id}`), { skipUnchangedRender: true });
   } catch (err) {
     statusEl.textContent = "Error: " + err.message;
   }
@@ -677,6 +693,8 @@ async function pollEngineReply() {
 async function doMove(from, to, promotion) {
   const humanCapture = moveWasCapture(from, to);
   const el = pieceAt[from];
+  const capturedEl = pieceAt[to];
+  if (humanCapture && capturedEl) capturedEl.style.visibility = "hidden";
   if (el) placePiece(el, to, true);
   if (humanCapture) playCaptureSound();
   statusEl.textContent = "Engine is thinking...";
