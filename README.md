@@ -69,7 +69,7 @@ For shared metrics, point the app at Supabase/Postgres instead:
 ```powershell
 uv sync --extra dev --extra postgres
 $env:GROKCHESS_DB_BACKEND="postgres"
-$env:GROKCHESS_DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/postgres?sslmode=require"
+$env:GROKCHESS_DATABASE_URL="postgresql://USER:PASSWORD@POOLER_HOST:PORT/postgres?sslmode=require"
 & ".\.venv\Scripts\python.exe" -m grokchess.desktop
 ```
 
@@ -78,9 +78,14 @@ On Linux/macOS:
 ```bash
 uv sync --extra dev --extra postgres
 export GROKCHESS_DB_BACKEND=postgres
-export GROKCHESS_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/postgres?sslmode=require'
+export GROKCHESS_DATABASE_URL='postgresql://USER:PASSWORD@POOLER_HOST:PORT/postgres?sslmode=require'
 ./.venv/bin/python -m grokchess.desktop
 ```
+
+In Supabase, use the **Session pooler** or **Transaction pooler** connection
+string from Project Settings -> Database -> Connection string. Avoid the direct
+`db.<project>.supabase.co` host for this project; on some networks it resolves
+only over IPv6 and Python may fail with `getaddrinfo failed`.
 
 Use a normal app database user for grokchess writes. For Grafana, create a
 separate read-only Postgres user and connect Grafana to the same Supabase

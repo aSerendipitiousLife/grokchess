@@ -866,7 +866,8 @@ async function pollTournament(jobId) {
 function renderTournamentProgress(data) {
   const total = data.total_games || data.games.length;
   const done = data.completed_games ?? data.games.length;
-  statusEl.textContent = data.status === "done" ? "Tournament complete" : "Tournament running...";
+  const warning = data.warnings && data.warnings.length ? ` Metrics warning: ${data.warnings[0]}` : "";
+  statusEl.textContent = (data.status === "done" ? "Tournament complete" : "Tournament running...") + warning;
   turnEl.textContent = `${done}/${total} games complete`;
 }
 

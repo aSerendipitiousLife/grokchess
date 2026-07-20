@@ -6,7 +6,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import grokchess.metrics_db as metrics_db
+import grokchess.web.app as web_app
 from grokchess.web.app import app
+
+metrics_db.DB_BACKEND = "sqlite"
+metrics_db.DATABASE_URL = ""
+metrics_db._READY = False
 
 
 def test_tournament_job_completes():
@@ -66,3 +71,38 @@ def test_postgres_backend_requires_database_url(monkeypatch):
 
     monkeypatch.setattr(metrics_db, "DB_BACKEND", "sqlite")
     monkeypatch.setattr(metrics_db, "_READY", False)
+
+
+def test_metrics_endpoint_reports_database_unavailable(monkeypatch):
+    def fail_metrics():
+        raise RuntimeError("database is sleeping")
+
+    monkeypatch.setattr(web_app, "metrics_summary", fail_metrics)
+
+    response = TestClient(app).get("/api/metrics")
+
+    assert response.status_code == 503
+    assert "Database unavailable" in response.json()["detail"]
+
+
+def test_tournament_completes_when_metrics_recording_fails(monkeypatch):
+    def fail_recording(result, *, mode="tournament"):
+        raise RuntimeError("database is sleeping")
+
+    monkeypatch.setattr(web_app, "record_result_game", fail_recording)
+    client = TestClient(app)
+
+    started = client.post("/api/tournament/start", json={"rounds": 1, "max_plies": 4})
+    assert started.status_code == 200
+    job = started.json()
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        job = client.get(f"/api/tournament/status/{job['id']}").json()
+        if job["status"] == "done":
+            break
+        time.sleep(0.1)
+
+    assert job["status"] == "done"
+    assert job["completed_games"] == job["total_games"]
+    assert "Database unavailable" in job["warnings"][0]

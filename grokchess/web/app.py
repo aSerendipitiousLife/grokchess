@@ -62,6 +62,20 @@ _TOURNAMENTS: dict[str, dict] = {}
 _TOURNAMENT_LOCK = threading.Lock()
 
 
+def _database_detail(exc: Exception) -> str:
+    detail = f"Database unavailable: {exc!r}"
+    if "supabase.co" in str(exc) and "failed to resolve host 'db." in str(exc):
+        detail += (
+            ". Supabase direct database hosts can be IPv6-only; use the "
+            "Session pooler or Transaction pooler connection string instead."
+        )
+    return detail
+
+
+def _raise_database_error(exc: Exception) -> None:
+    raise HTTPException(status_code=503, detail=_database_detail(exc)) from exc
+
+
 def _registry() -> dict[str, type]:
     if not _REGISTRY:
         for cls in load_engines(ENGINES_DIR):
@@ -236,11 +250,16 @@ def login(req: LoginReq):
         return login_player(req.name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
+        _raise_database_error(exc)
 
 
 @app.get("/api/metrics")
 def metrics():
-    return metrics_summary()
+    try:
+        return metrics_summary()
+    except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
+        _raise_database_error(exc)
 
 
 @app.get("/api/engines")
@@ -267,19 +286,25 @@ def new_game(req: NewGame):
     if req.player_id and req.player_name:
         player = {"id": req.player_id, "name": req.player_name}
     elif req.player_name:
-        player = login_player(req.player_name)
+        try:
+            player = login_player(req.player_name)
+        except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
+            _raise_database_error(exc)
     player_name = player["name"] if player else "Human"
     player_id = player["id"] if player else None
     human_is_white = req.human_color == "white"
-    db_game_id = start_game(
-        mode="human",
-        white_name=player_name if human_is_white else req.engine,
-        white_kind="player" if human_is_white else "engine",
-        white_player_id=player_id if human_is_white else None,
-        black_name=req.engine if human_is_white else player_name,
-        black_kind="engine" if human_is_white else "player",
-        black_player_id=None if human_is_white else player_id,
-    )
+    try:
+        db_game_id = start_game(
+            mode="human",
+            white_name=player_name if human_is_white else req.engine,
+            white_kind="player" if human_is_white else "engine",
+            white_player_id=player_id if human_is_white else None,
+            black_name=req.engine if human_is_white else player_name,
+            black_kind="engine" if human_is_white else "player",
+            black_player_id=None if human_is_white else player_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
+        _raise_database_error(exc)
     game = {
         "board": chess.Board(),
         "engine": registry[req.engine](),
@@ -293,7 +318,10 @@ def new_game(req: NewGame):
         "move_events": [],
     }
     _GAMES[game_id] = game
-    _engine_reply(game)  # engine moves first if the human chose Black
+    try:
+        _engine_reply(game)  # engine moves first if the human chose Black
+    except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
+        _raise_database_error(exc)
     return _state(game_id)
 
 
@@ -311,9 +339,12 @@ def move(req: MoveReq):
     chosen = _resolve_move(board, req.from_sq, req.to_sq, req.promotion)
     if chosen is None:
         raise HTTPException(status_code=400, detail=f"illegal move: {req.from_sq}{req.to_sq}")
-    _push_recorded_move(game, chosen, "human")
-    _engine_reply(game)
-    _finish_db_game_if_needed(game)
+    try:
+        _push_recorded_move(game, chosen, "human")
+        _engine_reply(game)
+        _finish_db_game_if_needed(game)
+    except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
+        _raise_database_error(exc)
     return _state(req.game_id)
 
 
@@ -393,6 +424,7 @@ def _new_standings(classes):
 def _run_tournament_sync(classes, req: TournamentReq, on_game=None) -> dict:
     standings = _new_standings(classes)
     games = []
+    warnings = []
     for _ in range(req.rounds):
         for white_cls, black_cls in itertools.permutations(classes, 2):
             result = play_game(
@@ -401,13 +433,18 @@ def _run_tournament_sync(classes, req: TournamentReq, on_game=None) -> dict:
                 time_limit=req.time_limit,
                 max_plies=req.max_plies,
             )
-            record_result_game(result, mode="tournament")
+            try:
+                record_result_game(result, mode="tournament")
+            except Exception as exc:  # noqa: BLE001 - metrics should not kill simulations
+                warning = _database_detail(exc)
+                if warning not in warnings:
+                    warnings.append(warning)
             _tally(standings[white_cls], standings[black_cls], result)
             payload = _result_payload(result)
             games.append(payload)
             if on_game is not None:
-                on_game(_standings_payload(standings), payload)
-    return {"standings": _standings_payload(standings), "games": games}
+                on_game(_standings_payload(standings), payload, warnings)
+    return {"standings": _standings_payload(standings), "games": games, "warnings": warnings}
 
 
 def _job_snapshot(job: dict) -> dict:
@@ -419,16 +456,18 @@ def _job_snapshot(job: dict) -> dict:
         "standings": list(job["standings"]),
         "games": list(job["games"]),
         "error": job.get("error"),
+        "warnings": list(job.get("warnings", [])),
     }
 
 
 def _run_tournament_job(job_id: str, classes, req: TournamentReq) -> None:
-    def on_game(standings, game):
+    def on_game(standings, game, warnings):
         with _TOURNAMENT_LOCK:
             job = _TOURNAMENTS[job_id]
             job["completed_games"] += 1
             job["standings"] = standings
             job["games"].append(game)
+            job["warnings"] = warnings
 
     try:
         result = _run_tournament_sync(classes, req, on_game=on_game)
@@ -437,6 +476,7 @@ def _run_tournament_job(job_id: str, classes, req: TournamentReq) -> None:
             job["status"] = "done"
             job["standings"] = result["standings"]
             job["games"] = result["games"]
+            job["warnings"] = result["warnings"]
             job["completed_games"] = job["total_games"]
     except Exception as exc:  # noqa: BLE001 - surfaced to the browser
         with _TOURNAMENT_LOCK:
@@ -473,6 +513,7 @@ def start_tournament(req: TournamentReq):
             "standings": _standings_payload(_new_standings(classes)),
             "games": [],
             "error": None,
+            "warnings": [],
         }
 
     worker = threading.Thread(
