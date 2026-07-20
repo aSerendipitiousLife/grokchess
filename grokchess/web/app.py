@@ -26,6 +26,14 @@ from pydantic import BaseModel, Field
 
 from ..arena import DEFAULT_TIME_LIMIT, MoveTimeout, _natural_reason, call_with_time_limit, play_game
 from ..discovery import load_engines
+from ..metrics_db import (
+    finish_game,
+    login_player,
+    metrics_summary,
+    record_move,
+    record_result_game,
+    start_game,
+)
 from ..tournament import Standing, _tally
 
 TIME_LIMIT = float(os.environ.get("GROKCHESS_TIME_LIMIT", DEFAULT_TIME_LIMIT))
@@ -64,6 +72,12 @@ def _registry() -> dict[str, type]:
 class NewGame(BaseModel):
     engine: str
     human_color: str = "white"
+    player_id: str | None = None
+    player_name: str | None = None
+
+
+class LoginReq(BaseModel):
+    name: str
 
 
 class TournamentReq(BaseModel):
@@ -83,6 +97,16 @@ class MoveReq(BaseModel):
 
 def _human_wins_status(game: dict) -> str:
     return "white_wins" if game["human_color"] == chess.WHITE else "black_wins"
+
+
+def _game_result_for_status(status: str) -> str:
+    if status == "white_wins":
+        return "1-0"
+    if status == "black_wins":
+        return "0-1"
+    if status == "draw":
+        return "1/2-1/2"
+    return ""
 
 
 def _status(game: dict):
@@ -120,22 +144,28 @@ def _resolve_move(board: chess.Board, frm: str, to: str, promotion: str | None):
 
 def _push_recorded_move(game: dict, move: chess.Move, actor: str) -> None:
     board = game["board"]
-    moving_piece = board.piece_at(move.from_square)
-    captured_piece = board.piece_at(move.to_square)
-    if board.is_en_passant(move):
-        offset = -8 if board.turn == chess.WHITE else 8
-        captured_piece = board.piece_at(move.to_square + offset)
-    event = {
-        "uci": move.uci(),
-        "from": chess.square_name(move.from_square),
-        "to": chess.square_name(move.to_square),
-        "piece": moving_piece.symbol() if moving_piece else "",
-        "captured": captured_piece.symbol() if captured_piece else None,
-        "actor": actor,
-    }
+    event = record_move(
+        game["db_game_id"],
+        board,
+        move,
+        actor_name=game["player_name"] if actor == "human" else game["engine_name"],
+        actor_kind="player" if actor == "human" else "engine",
+    )
+    event["actor"] = actor
     board.push(move)
     game["last_move"] = move.uci()
     game["move_events"].append(event)
+    _finish_db_game_if_needed(game)
+
+
+def _finish_db_game_if_needed(game: dict) -> None:
+    if game.get("db_finished"):
+        return
+    status, reason, detail = _status(game)
+    result = _game_result_for_status(status)
+    if result:
+        finish_game(game["db_game_id"], result, reason, detail)
+        game["db_finished"] = True
 
 
 def _engine_reply(game: dict) -> None:
@@ -152,12 +182,15 @@ def _engine_reply(game: dict) -> None:
         )
     except MoveTimeout as exc:
         game["forfeit"] = (_human_wins_status(game), "timeout", str(exc))
+        _finish_db_game_if_needed(game)
         return
     except Exception as exc:  # noqa: BLE001 - engine bug forfeits
         game["forfeit"] = (_human_wins_status(game), "engine_error", repr(exc))
+        _finish_db_game_if_needed(game)
         return
     if not isinstance(move, chess.Move) or move not in board.legal_moves:
         game["forfeit"] = (_human_wins_status(game), "illegal_move", str(move))
+        _finish_db_game_if_needed(game)
         return
     _push_recorded_move(game, move, "engine")
 
@@ -197,6 +230,19 @@ def index() -> str:
     return _INDEX_HTML
 
 
+@app.post("/api/login")
+def login(req: LoginReq):
+    try:
+        return login_player(req.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/metrics")
+def metrics():
+    return metrics_summary()
+
+
 @app.get("/api/engines")
 def engines():
     return [
@@ -217,11 +263,32 @@ def new_game(req: NewGame):
     while len(_GAMES) >= MAX_GAMES:
         _GAMES.pop(next(iter(_GAMES)))
     game_id = uuid.uuid4().hex[:12]
+    player = None
+    if req.player_id and req.player_name:
+        player = {"id": req.player_id, "name": req.player_name}
+    elif req.player_name:
+        player = login_player(req.player_name)
+    player_name = player["name"] if player else "Human"
+    player_id = player["id"] if player else None
+    human_is_white = req.human_color == "white"
+    db_game_id = start_game(
+        mode="human",
+        white_name=player_name if human_is_white else req.engine,
+        white_kind="player" if human_is_white else "engine",
+        white_player_id=player_id if human_is_white else None,
+        black_name=req.engine if human_is_white else player_name,
+        black_kind="engine" if human_is_white else "player",
+        black_player_id=None if human_is_white else player_id,
+    )
     game = {
         "board": chess.Board(),
         "engine": registry[req.engine](),
         "engine_name": req.engine,
         "human_color": chess.WHITE if req.human_color == "white" else chess.BLACK,
+        "player_name": player_name,
+        "player_id": player_id,
+        "db_game_id": db_game_id,
+        "db_finished": False,
         "last_move": None,
         "move_events": [],
     }
@@ -246,6 +313,7 @@ def move(req: MoveReq):
         raise HTTPException(status_code=400, detail=f"illegal move: {req.from_sq}{req.to_sq}")
     _push_recorded_move(game, chosen, "human")
     _engine_reply(game)
+    _finish_db_game_if_needed(game)
     return _state(req.game_id)
 
 
@@ -333,6 +401,7 @@ def _run_tournament_sync(classes, req: TournamentReq, on_game=None) -> dict:
                 time_limit=req.time_limit,
                 max_plies=req.max_plies,
             )
+            record_result_game(result, mode="tournament")
             _tally(standings[white_cls], standings[black_cls], result)
             payload = _result_payload(result)
             games.append(payload)

@@ -29,8 +29,8 @@
     background: var(--bg);
     color: var(--text);
   }
-  button, select { font: inherit; }
-  button, select {
+  button, select, input { font: inherit; }
+  button, select, input {
     font-size: 0.95rem;
     padding: 0.45rem 0.7rem;
     border-radius: 8px;
@@ -213,6 +213,8 @@
     text-align: left;
   }
   th { color: var(--muted); font-weight: 600; }
+  h3 { margin: 0.2rem 0 0; font-size: 1rem; }
+  .muted { color: var(--muted); }
   .games {
     max-height: 220px;
     overflow: auto;
@@ -249,6 +251,7 @@
     <div class="tabs" role="tablist">
       <button class="tab active" data-mode="play">Fight Bot</button>
       <button class="tab" data-mode="tournament">Tournament</button>
+      <button class="tab" data-mode="metrics">Metrics</button>
     </div>
   </header>
 
@@ -263,6 +266,8 @@
   <aside class="side">
     <section class="panel" id="play-panel">
       <div class="controls">
+        <label>Player <input id="player-name" placeholder="Your name"></label>
+        <button id="login" class="secondary">Login</button>
         <label>Engine <select id="engine"></select></label>
         <label>You play
           <select id="color">
@@ -301,6 +306,14 @@
       </div>
     </section>
 
+    <section class="panel hidden" id="metrics-panel">
+      <div class="controls">
+        <button id="refresh-metrics" class="primary">Refresh Metrics</button>
+      </div>
+      <div id="player-metrics"></div>
+      <div id="engine-metrics"></div>
+    </section>
+
     <section class="panel">
       <div id="status">Pick an engine and start a game.</div>
       <div id="turnline"></div>
@@ -336,6 +349,7 @@ let watchGameIndex = 0;
 let watchFrameIndex = 0;
 let watchTimer = null;
 let audioCtx = null;
+let player = JSON.parse(localStorage.getItem("grokchess.player") || "null");
 
 const boardEl = document.getElementById("board");
 const squaresEl = document.getElementById("squares");
@@ -671,12 +685,26 @@ async function newGame() {
     state = await api("/api/new", {
       engine: document.getElementById("engine").value,
       human_color: document.getElementById("color").value,
+      player_id: player ? player.id : null,
+      player_name: player ? player.name : document.getElementById("player-name").value,
     });
     playState = state;
     renderedEvents = state.move_events.length;
     let animate = null;
     if (state.last_move) animate = { from: state.last_move.slice(0, 2), to: state.last_move.slice(2, 4) };
     render(animate);
+  } catch (err) {
+    statusEl.textContent = "Error: " + err.message;
+  }
+}
+
+async function login() {
+  try {
+    player = await api("/api/login", { name: document.getElementById("player-name").value });
+    localStorage.setItem("grokchess.player", JSON.stringify(player));
+    document.getElementById("player-name").value = player.name;
+    statusEl.textContent = `Logged in as ${player.name}`;
+    await loadMetrics();
   } catch (err) {
     statusEl.textContent = "Error: " + err.message;
   }
@@ -722,6 +750,29 @@ function renderStandings(data) {
   for (const btn of document.querySelectorAll(".game-row")) {
     btn.addEventListener("click", () => showWatchGame(parseInt(btn.dataset.game, 10)));
   }
+}
+
+function metricsTable(title, rows) {
+  if (!rows.length) return `<h3>${title}</h3><div class="muted">No games recorded yet.</div>`;
+  return `
+    <h3>${title}</h3>
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Games</th><th>W</th><th>D</th><th>L</th><th>Moves</th><th>Capt</th><th>Checks</th><th>Mate</th></tr>
+      </thead>
+      <tbody>${rows.map(row => `
+        <tr>
+          <td>${row.name}</td><td>${row.games}</td><td>${row.wins}</td><td>${row.draws}</td><td>${row.losses}</td>
+          <td>${row.moves}</td><td>${row.captures}</td><td>${row.checks}</td><td>${row.checkmates}</td>
+        </tr>
+      `).join("")}</tbody>
+    </table>`;
+}
+
+async function loadMetrics() {
+  const data = await api("/api/metrics");
+  document.getElementById("player-metrics").innerHTML = metricsTable("Players", data.players);
+  document.getElementById("engine-metrics").innerHTML = metricsTable("Engines", data.engines);
 }
 
 function showWatchGame(index) {
@@ -862,6 +913,7 @@ function syncModeUi() {
   }
   document.getElementById("play-panel").classList.toggle("hidden", mode !== "play");
   document.getElementById("tournament-panel").classList.toggle("hidden", mode !== "tournament");
+  document.getElementById("metrics-panel").classList.toggle("hidden", mode !== "metrics");
 }
 
 function setMode(nextMode) {
@@ -874,6 +926,11 @@ function setMode(nextMode) {
     orientationOverride = null;
     state = playState;
     render();
+  } else if (mode === "metrics") {
+    loadMetrics().catch(err => { statusEl.textContent = "Error: " + err.message; });
+    if (!state) buildSquares();
+    statusEl.textContent = "Metrics from recorded games.";
+    turnEl.textContent = player ? `Logged in as ${player.name}` : "Login before playing to track your moves.";
   } else if (tournament && tournament.games.length) {
     renderWatchFrame(null);
   } else {
@@ -886,9 +943,11 @@ function setMode(nextMode) {
 }
 
 document.getElementById("new").addEventListener("click", newGame);
+document.getElementById("login").addEventListener("click", login);
 document.getElementById("flip").addEventListener("click", flip);
 document.getElementById("resign").addEventListener("click", resign);
 document.getElementById("run-tournament").addEventListener("click", runTournament);
+document.getElementById("refresh-metrics").addEventListener("click", () => loadMetrics().catch(err => { statusEl.textContent = "Error: " + err.message; }));
 document.getElementById("prev-game").addEventListener("click", () => showWatchGame(watchGameIndex - 1));
 document.getElementById("next-game").addEventListener("click", () => showWatchGame(watchGameIndex + 1));
 document.getElementById("play-watch").addEventListener("click", () => watchTimer ? stopWatch() : startWatch());
@@ -902,7 +961,9 @@ document.addEventListener("pointerdown", () => {
 
 syncModeUi();
 buildSquares();
+if (player) document.getElementById("player-name").value = player.name;
 loadEngines();
+loadMetrics().catch(() => {});
 </script>
 </body>
 </html>

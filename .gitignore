@@ -16,6 +16,7 @@ venv/
 
 # Tournament output (recorded games)
 games/
+data/
 
 # OS cruft
 .DS_Store

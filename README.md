@@ -59,6 +59,11 @@ On Linux/macOS with the local virtual environment:
 ./.venv/bin/python -m grokchess.desktop
 ```
 
+The web app records game and tournament metrics in a local SQLite database at
+`data/grokchess.sqlite` by default. Use the Player login field before starting a
+game if you want your human moves tracked; tournament simulations automatically
+track engine metrics.
+
 ## Write your own engine
 
 New to pull requests? [`CONTRIBUTING.md`](CONTRIBUTING.md) walks through the
