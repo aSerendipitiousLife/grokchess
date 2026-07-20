@@ -83,6 +83,16 @@ def _add_db_warning(game: dict, exc: Exception) -> None:
         warnings.append(warning)
 
 
+def _run_db_later(game: dict, work) -> None:
+    def runner() -> None:
+        try:
+            work()
+        except Exception as exc:  # noqa: BLE001 - gameplay should not wait on metrics
+            _add_db_warning(game, exc)
+
+    threading.Thread(target=runner, name="grokchess-metrics", daemon=True).start()
+
+
 def _registry() -> dict[str, type]:
     if not _REGISTRY:
         for cls in load_engines(ENGINES_DIR):
@@ -167,16 +177,21 @@ def _push_recorded_move(game: dict, move: chess.Move, actor: str) -> None:
     board = game["board"]
     event = _frame_event(board, move)
     if game.get("db_game_id"):
-        try:
-            event = record_move(
-                game["db_game_id"],
-                board,
+        board_before = board.copy()
+        db_game_id = game["db_game_id"]
+        actor_name = game["player_name"] if actor == "human" else game["engine_name"]
+        actor_kind = "player" if actor == "human" else "engine"
+
+        def record() -> None:
+            record_move(
+                db_game_id,
+                board_before,
                 move,
-                actor_name=game["player_name"] if actor == "human" else game["engine_name"],
-                actor_kind="player" if actor == "human" else "engine",
+                actor_name=actor_name,
+                actor_kind=actor_kind,
             )
-        except Exception as exc:  # noqa: BLE001 - gameplay should survive metrics outages
-            _add_db_warning(game, exc)
+
+        _run_db_later(game, record)
     event["actor"] = actor
     board.push(move)
     game["last_move"] = move.uci()
@@ -190,10 +205,12 @@ def _finish_db_game_if_needed(game: dict) -> None:
     status, reason, detail = _status(game)
     result = _game_result_for_status(status)
     if result:
-        try:
-            finish_game(game["db_game_id"], result, reason, detail)
-        except Exception as exc:  # noqa: BLE001 - gameplay should survive metrics outages
-            _add_db_warning(game, exc)
+        db_game_id = game["db_game_id"]
+
+        def finish() -> None:
+            finish_game(db_game_id, result, reason, detail)
+
+        _run_db_later(game, finish)
         game["db_finished"] = True
 
 

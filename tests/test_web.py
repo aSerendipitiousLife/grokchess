@@ -170,4 +170,36 @@ def test_move_still_advances_when_metrics_recording_fails(monkeypatch):
     data = response.json()
     assert data["fen"] != state["fen"]
     assert data["move_events"]
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        data = client.get(f"/api/state/{state['game_id']}").json()
+        if data["warnings"]:
+            break
+        time.sleep(0.05)
+
     assert "Database unavailable" in data["warnings"][0]
+
+
+def test_move_response_does_not_wait_for_metrics_write(monkeypatch):
+    client = TestClient(app)
+    started = client.post("/api/new", json={"engine": "random-mover", "human_color": "white"})
+    assert started.status_code == 200
+    state = started.json()
+    move = state["legal_moves"][0]
+
+    def slow_record_move(*args, **kwargs):
+        time.sleep(0.75)
+        return {}
+
+    monkeypatch.setattr(web_app, "record_move", slow_record_move)
+
+    started_at = time.monotonic()
+    response = client.post(
+        "/api/move",
+        json={"game_id": state["game_id"], "from": move["from"], "to": move["to"]},
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert response.status_code == 200
+    assert elapsed < 0.5
