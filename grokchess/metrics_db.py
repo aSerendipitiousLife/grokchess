@@ -47,7 +47,7 @@ def _connect():
                 "Postgres metrics require `psycopg`. Install with "
                 '`uv sync --extra dev --extra postgres`.'
             ) from exc
-        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None)
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)

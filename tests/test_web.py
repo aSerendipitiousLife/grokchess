@@ -1,6 +1,8 @@
 """Web API smoke tests."""
 
+import sys
 import time
+import types
 
 import pytest
 from fastapi.testclient import TestClient
@@ -70,6 +72,30 @@ def test_postgres_backend_requires_database_url(monkeypatch):
         metrics_db.init_db()
 
     monkeypatch.setattr(metrics_db, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(metrics_db, "_READY", False)
+
+
+def test_postgres_pooler_connection_disables_prepared_statements(monkeypatch):
+    calls = []
+
+    def connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    fake_psycopg = types.SimpleNamespace(connect=connect)
+    fake_rows = types.SimpleNamespace(dict_row=object())
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    monkeypatch.setitem(sys.modules, "psycopg.rows", fake_rows)
+    monkeypatch.setattr(metrics_db, "DB_BACKEND", "postgres")
+    monkeypatch.setattr(metrics_db, "DATABASE_URL", "postgresql://example")
+
+    conn = metrics_db._connect()
+
+    assert conn is not None
+    assert calls[0][1]["prepare_threshold"] is None
+
+    monkeypatch.setattr(metrics_db, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(metrics_db, "DATABASE_URL", "")
     monkeypatch.setattr(metrics_db, "_READY", False)
 
 
