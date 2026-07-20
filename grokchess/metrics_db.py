@@ -168,6 +168,138 @@ def _fetchone(conn, sql: str, params=()):
     return dict(row) if row is not None else None
 
 
+def _executemany(conn, sql: str, rows: list[tuple]) -> None:
+    if not rows:
+        return
+    if hasattr(conn, "executemany"):
+        conn.executemany(sql, rows)
+        return
+    with conn.cursor() as cursor:
+        cursor.executemany(sql, rows)
+
+
+def _insert_game(
+    conn,
+    *,
+    game_id: str,
+    mode: str,
+    white_name: str,
+    white_kind: str,
+    black_name: str,
+    black_kind: str,
+    started_at: float,
+    white_player_id: str | None = None,
+    black_player_id: str | None = None,
+) -> None:
+    ph = _placeholder()
+    conn.execute(
+        f"""
+        INSERT INTO games (
+            id, mode, white_name, white_kind, white_player_id,
+            black_name, black_kind, black_player_id, started_at
+        )
+        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+        """,
+        (
+            game_id,
+            mode,
+            white_name,
+            white_kind,
+            white_player_id,
+            black_name,
+            black_kind,
+            black_player_id,
+            started_at,
+        ),
+    )
+
+
+def _move_event_and_row(
+    game_id: str,
+    board_before: chess.Board,
+    move: chess.Move,
+    *,
+    actor_name: str,
+    actor_kind: str,
+) -> tuple[dict, tuple]:
+    moving_piece = board_before.piece_at(move.from_square)
+    captured_piece = board_before.piece_at(move.to_square)
+    if board_before.is_en_passant(move):
+        offset = -8 if board_before.turn == chess.WHITE else 8
+        captured_piece = board_before.piece_at(move.to_square + offset)
+    board_after = board_before.copy()
+    board_after.push(move)
+    event = {
+        "uci": move.uci(),
+        "from": chess.square_name(move.from_square),
+        "to": chess.square_name(move.to_square),
+        "piece": moving_piece.symbol() if moving_piece else "",
+        "captured": captured_piece.symbol() if captured_piece else None,
+        "actor": actor_name,
+    }
+    return event, (
+        game_id,
+        board_before.ply() + 1,
+        actor_name,
+        actor_kind,
+        "white" if board_before.turn == chess.WHITE else "black",
+        move.uci(),
+        event["piece"],
+        event["captured"],
+        int(event["captured"] is not None),
+        int(board_after.is_check()),
+        int(board_after.is_checkmate()),
+        board_after.fen(),
+    )
+
+
+def _insert_move_rows(conn, rows: list[tuple]) -> None:
+    ph = _placeholder()
+    _executemany(
+        conn,
+        f"""
+        INSERT INTO moves (
+            game_id, ply, actor_name, actor_kind, color, uci, piece, captured,
+            is_capture, is_check, is_checkmate, fen_after
+        )
+        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+        """,
+        rows,
+    )
+
+
+def _finish_game_row(
+    conn,
+    game_id: str,
+    result: str,
+    reason: str,
+    detail: str = "",
+    *,
+    finished_at: float | None = None,
+    ply_count: int | None = None,
+) -> None:
+    ph = _placeholder()
+    if ply_count is None:
+        conn.execute(
+            f"""
+            UPDATE games
+            SET result = {ph}, reason = {ph}, detail = {ph}, finished_at = COALESCE(finished_at, {ph})
+            WHERE id = {ph}
+            """,
+            (result, reason, detail, finished_at or time.time(), game_id),
+        )
+        return
+    conn.execute(
+        f"""
+        UPDATE games
+        SET result = {ph}, reason = {ph}, detail = {ph},
+            finished_at = COALESCE(finished_at, {ph}), ply_count = {ph}
+        WHERE id = {ph}
+        """,
+        (result, reason, detail, finished_at or time.time(), ply_count, game_id),
+    )
+
+
 def login_player(name: str) -> dict:
     init_db()
     clean = " ".join(name.strip().split())
@@ -198,27 +330,18 @@ def start_game(
 ) -> str:
     init_db()
     game_id = uuid.uuid4().hex[:12]
-    ph = _placeholder()
     with _LOCK, _connect() as conn:
-        conn.execute(
-            f"""
-            INSERT INTO games (
-                id, mode, white_name, white_kind, white_player_id,
-                black_name, black_kind, black_player_id, started_at
-            )
-            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
-            """,
-            (
-                game_id,
-                mode,
-                white_name,
-                white_kind,
-                white_player_id,
-                black_name,
-                black_kind,
-                black_player_id,
-                time.time(),
-            ),
+        _insert_game(
+            conn,
+            game_id=game_id,
+            mode=mode,
+            white_name=white_name,
+            white_kind=white_kind,
+            white_player_id=white_player_id,
+            black_name=black_name,
+            black_kind=black_kind,
+            black_player_id=black_player_id,
+            started_at=time.time(),
         )
     return game_id
 
@@ -232,79 +355,65 @@ def record_move(
     actor_kind: str,
 ) -> dict:
     init_db()
-    moving_piece = board_before.piece_at(move.from_square)
-    captured_piece = board_before.piece_at(move.to_square)
-    if board_before.is_en_passant(move):
-        offset = -8 if board_before.turn == chess.WHITE else 8
-        captured_piece = board_before.piece_at(move.to_square + offset)
-    board_after = board_before.copy()
-    board_after.push(move)
-    event = {
-        "uci": move.uci(),
-        "from": chess.square_name(move.from_square),
-        "to": chess.square_name(move.to_square),
-        "piece": moving_piece.symbol() if moving_piece else "",
-        "captured": captured_piece.symbol() if captured_piece else None,
-        "actor": actor_name,
-    }
+    event, row = _move_event_and_row(
+        game_id,
+        board_before,
+        move,
+        actor_name=actor_name,
+        actor_kind=actor_kind,
+    )
     ph = _placeholder()
     with _LOCK, _connect() as conn:
-        conn.execute(
-            f"""
-            INSERT INTO moves (
-                game_id, ply, actor_name, actor_kind, color, uci, piece, captured,
-                is_capture, is_check, is_checkmate, fen_after
-            )
-            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
-            """,
-            (
-                game_id,
-                board_before.ply() + 1,
-                actor_name,
-                actor_kind,
-                "white" if board_before.turn == chess.WHITE else "black",
-                move.uci(),
-                event["piece"],
-                event["captured"],
-                int(event["captured"] is not None),
-                int(board_after.is_check()),
-                int(board_after.is_checkmate()),
-                board_after.fen(),
-            ),
-        )
+        _insert_move_rows(conn, [row])
         conn.execute(f"UPDATE games SET ply_count = ply_count + 1 WHERE id = {ph}", (game_id,))
     return event
 
 
 def finish_game(game_id: str, result: str, reason: str, detail: str = "") -> None:
     init_db()
-    ph = _placeholder()
     with _LOCK, _connect() as conn:
-        conn.execute(
-            f"""
-            UPDATE games
-            SET result = {ph}, reason = {ph}, detail = {ph}, finished_at = COALESCE(finished_at, {ph})
-            WHERE id = {ph}
-            """,
-            (result, reason, detail, time.time(), game_id),
-        )
+        _finish_game_row(conn, game_id, result, reason, detail)
 
 
 def record_result_game(result: GameResult, *, mode: str = "tournament") -> str:
+    init_db()
     board = chess.Board()
-    game_id = start_game(
-        mode=mode,
-        white_name=result.white,
-        white_kind="engine",
-        black_name=result.black,
-        black_kind="engine",
-    )
+    game_id = uuid.uuid4().hex[:12]
+    move_rows = []
     for uci in result.moves:
         move = chess.Move.from_uci(uci)
         actor_name = result.white if board.turn == chess.WHITE else result.black
-        record_move(game_id, board, move, actor_name=actor_name, actor_kind="engine")
+        _, row = _move_event_and_row(
+            game_id,
+            board,
+            move,
+            actor_name=actor_name,
+            actor_kind="engine",
+        )
+        move_rows.append(row)
         board.push(move)
-    finish_game(game_id, result.result, result.reason, result.detail)
+    now = time.time()
+    with _LOCK, _connect() as conn:
+        _insert_game(
+            conn,
+            game_id=game_id,
+            mode=mode,
+            white_name=result.white,
+            white_kind="engine",
+            black_name=result.black,
+            black_kind="engine",
+            started_at=now,
+        )
+        _insert_move_rows(conn, move_rows)
+        _finish_game_row(
+            conn,
+            game_id,
+            result.result,
+            result.reason,
+            result.detail,
+            finished_at=time.time(),
+            ply_count=len(move_rows),
+        )
     return game_id
 
 
