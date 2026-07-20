@@ -76,6 +76,13 @@ def _raise_database_error(exc: Exception) -> None:
     raise HTTPException(status_code=503, detail=_database_detail(exc)) from exc
 
 
+def _add_db_warning(game: dict, exc: Exception) -> None:
+    warning = _database_detail(exc)
+    warnings = game.setdefault("db_warnings", [])
+    if warning not in warnings:
+        warnings.append(warning)
+
+
 def _registry() -> dict[str, type]:
     if not _REGISTRY:
         for cls in load_engines(ENGINES_DIR):
@@ -158,13 +165,18 @@ def _resolve_move(board: chess.Board, frm: str, to: str, promotion: str | None):
 
 def _push_recorded_move(game: dict, move: chess.Move, actor: str) -> None:
     board = game["board"]
-    event = record_move(
-        game["db_game_id"],
-        board,
-        move,
-        actor_name=game["player_name"] if actor == "human" else game["engine_name"],
-        actor_kind="player" if actor == "human" else "engine",
-    )
+    event = _frame_event(board, move)
+    if game.get("db_game_id"):
+        try:
+            event = record_move(
+                game["db_game_id"],
+                board,
+                move,
+                actor_name=game["player_name"] if actor == "human" else game["engine_name"],
+                actor_kind="player" if actor == "human" else "engine",
+            )
+        except Exception as exc:  # noqa: BLE001 - gameplay should survive metrics outages
+            _add_db_warning(game, exc)
     event["actor"] = actor
     board.push(move)
     game["last_move"] = move.uci()
@@ -173,12 +185,15 @@ def _push_recorded_move(game: dict, move: chess.Move, actor: str) -> None:
 
 
 def _finish_db_game_if_needed(game: dict) -> None:
-    if game.get("db_finished"):
+    if game.get("db_finished") or not game.get("db_game_id"):
         return
     status, reason, detail = _status(game)
     result = _game_result_for_status(status)
     if result:
-        finish_game(game["db_game_id"], result, reason, detail)
+        try:
+            finish_game(game["db_game_id"], result, reason, detail)
+        except Exception as exc:  # noqa: BLE001 - gameplay should survive metrics outages
+            _add_db_warning(game, exc)
         game["db_finished"] = True
 
 
@@ -236,6 +251,7 @@ def _state(game_id: str) -> dict:
         "reason": reason,
         "detail": detail,
         "move_number": board.fullmove_number,
+        "warnings": list(game.get("db_warnings", [])),
     }
 
 
@@ -283,13 +299,16 @@ def new_game(req: NewGame):
         _GAMES.pop(next(iter(_GAMES)))
     game_id = uuid.uuid4().hex[:12]
     player = None
+    db_warnings = []
     if req.player_id and req.player_name:
         player = {"id": req.player_id, "name": req.player_name}
     elif req.player_name:
         try:
             player = login_player(req.player_name)
         except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
-            _raise_database_error(exc)
+            clean = " ".join(req.player_name.strip().split())
+            player = {"id": None, "name": clean or "Human"}
+            db_warnings.append(_database_detail(exc))
     player_name = player["name"] if player else "Human"
     player_id = player["id"] if player else None
     human_is_white = req.human_color == "white"
@@ -304,7 +323,10 @@ def new_game(req: NewGame):
             black_player_id=None if human_is_white else player_id,
         )
     except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
-        _raise_database_error(exc)
+        db_game_id = None
+        warning = _database_detail(exc)
+        if warning not in db_warnings:
+            db_warnings.append(warning)
     game = {
         "board": chess.Board(),
         "engine": registry[req.engine](),
@@ -314,14 +336,12 @@ def new_game(req: NewGame):
         "player_id": player_id,
         "db_game_id": db_game_id,
         "db_finished": False,
+        "db_warnings": db_warnings,
         "last_move": None,
         "move_events": [],
     }
     _GAMES[game_id] = game
-    try:
-        _engine_reply(game)  # engine moves first if the human chose Black
-    except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
-        _raise_database_error(exc)
+    _engine_reply(game)  # engine moves first if the human chose Black
     return _state(game_id)
 
 
@@ -339,12 +359,9 @@ def move(req: MoveReq):
     chosen = _resolve_move(board, req.from_sq, req.to_sq, req.promotion)
     if chosen is None:
         raise HTTPException(status_code=400, detail=f"illegal move: {req.from_sq}{req.to_sq}")
-    try:
-        _push_recorded_move(game, chosen, "human")
-        _engine_reply(game)
-        _finish_db_game_if_needed(game)
-    except Exception as exc:  # noqa: BLE001 - surface database configuration issues cleanly
-        _raise_database_error(exc)
+    _push_recorded_move(game, chosen, "human")
+    _engine_reply(game)
+    _finish_db_game_if_needed(game)
     return _state(req.game_id)
 
 

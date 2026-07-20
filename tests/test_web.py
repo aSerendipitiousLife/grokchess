@@ -132,3 +132,42 @@ def test_tournament_completes_when_metrics_recording_fails(monkeypatch):
     assert job["status"] == "done"
     assert job["completed_games"] == job["total_games"]
     assert "Database unavailable" in job["warnings"][0]
+
+
+def test_new_game_still_starts_when_metrics_game_creation_fails(monkeypatch):
+    def fail_start_game(**kwargs):
+        raise RuntimeError("database is sleeping")
+
+    monkeypatch.setattr(web_app, "start_game", fail_start_game)
+    client = TestClient(app)
+
+    response = client.post("/api/new", json={"engine": "random-mover", "human_color": "white"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "playing"
+    assert "Database unavailable" in data["warnings"][0]
+
+
+def test_move_still_advances_when_metrics_recording_fails(monkeypatch):
+    client = TestClient(app)
+    started = client.post("/api/new", json={"engine": "random-mover", "human_color": "white"})
+    assert started.status_code == 200
+    state = started.json()
+    move = state["legal_moves"][0]
+
+    def fail_record_move(*args, **kwargs):
+        raise RuntimeError("database is sleeping")
+
+    monkeypatch.setattr(web_app, "record_move", fail_record_move)
+
+    response = client.post(
+        "/api/move",
+        json={"game_id": state["game_id"], "from": move["from"], "to": move["to"]},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["fen"] != state["fen"]
+    assert data["move_events"]
+    assert "Database unavailable" in data["warnings"][0]

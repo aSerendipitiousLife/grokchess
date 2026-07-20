@@ -493,9 +493,10 @@ function playCaptureSound() {
 function renderPlayStatus() {
   if (!state) return;
   const engine = state.engine;
+  const warning = state.warnings && state.warnings.length ? ` | Metrics warning: ${state.warnings[0]}` : "";
   if (state.status === "playing") {
     statusEl.textContent = state.turn === state.human_color ? "Your move" : `${engine} is thinking...`;
-    turnEl.textContent = `You: ${state.human_color} | Engine: ${engine} | move ${state.move_number}`;
+    turnEl.textContent = `You: ${state.human_color} | Engine: ${engine} | move ${state.move_number}${warning}`;
   } else {
     const outcome = { white_wins: "White wins", black_wins: "Black wins", draw: "Draw" }[state.status] || state.status;
     const youWon = (state.status === "white_wins" && state.human_color === "white") ||
@@ -504,7 +505,7 @@ function renderPlayStatus() {
     let reason = state.reason ? ` (${state.reason.replace(/_/g, " ")})` : "";
     if (state.detail) reason += ` | ${state.detail}`;
     statusEl.textContent = `${outcome}${tag}${reason}`;
-    turnEl.textContent = "";
+    turnEl.textContent = warning ? warning.slice(3) : "";
   }
 }
 
