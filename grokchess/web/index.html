@@ -151,6 +151,7 @@
     background-repeat: no-repeat;
     background-position: center;
     filter: drop-shadow(0 2px 2px rgba(0,0,0,0.3));
+    transform: translate3d(0, 0, 0);
     will-change: transform;
   }
   .piece.dragging {
@@ -324,6 +325,9 @@ let playState = null;
 let selected = null;
 let orientationOverride = null;
 let drag = null;
+let dragFrame = null;
+let dragPoint = null;
+let hoverSq = null;
 let pieceAt = {};
 let renderedEvents = 0;
 let tournament = null;
@@ -359,9 +363,12 @@ function displayToSquare(col, row) {
 
 function pointToSquare(clientX, clientY) {
   const rect = boardEl.getBoundingClientRect();
-  const size = rect.width / 8;
-  const col = Math.floor((clientX - rect.left) / size);
-  const row = Math.floor((clientY - rect.top) / size);
+  return pointToSquareWithin(clientX, clientY, rect.left, rect.top, rect.width / 8);
+}
+
+function pointToSquareWithin(clientX, clientY, left, top, size) {
+  const col = Math.floor((clientX - left) / size);
+  const row = Math.floor((clientY - top) / size);
   if (col < 0 || col > 7 || row < 0 || row > 7) return null;
   return displayToSquare(col, row);
 }
@@ -430,7 +437,7 @@ function buildSquares() {
 function placePiece(el, sq, animate) {
   const { col, row } = squareToDisplay(sq);
   el.style.transition = animate ? "transform 0.2s ease" : "none";
-  el.style.transform = `translate(${col * 100}%, ${row * 100}%)`;
+  el.style.transform = `translate3d(${col * 100}%, ${row * 100}%, 0)`;
 }
 
 function buildPieces(animateMove) {
@@ -487,11 +494,19 @@ function renderPlayStatus() {
   }
 }
 
-function clearHover() { squaresEl.querySelectorAll(".hover").forEach(c => c.classList.remove("hover")); }
+function clearHover() {
+  if (!hoverSq) return;
+  const cell = squaresEl.querySelector(`[data-square="${hoverSq}"]`);
+  if (cell) cell.classList.remove("hover");
+  hoverSq = null;
+}
 
 function setHover(sq) {
+  const next = sq && selected && targetsFrom(selected).includes(sq) ? sq : null;
+  if (next === hoverSq) return;
   clearHover();
-  if (sq && selected && targetsFrom(selected).includes(sq)) {
+  hoverSq = next;
+  if (hoverSq) {
     const cell = squaresEl.querySelector(`[data-square="${sq}"]`);
     if (cell) cell.classList.add("hover");
   }
@@ -514,7 +529,17 @@ function onDown(e) {
   if (mine && targetsFrom(sq).length) {
     selected = sq;
     buildSquares();
-    drag = { from: sq, el: pieceAt[sq], moved: false, x: e.clientX, y: e.clientY };
+    const rect = boardEl.getBoundingClientRect();
+    drag = {
+      from: sq,
+      el: pieceAt[sq],
+      moved: false,
+      x: e.clientX,
+      y: e.clientY,
+      left: rect.left,
+      top: rect.top,
+      size: rect.width / 8,
+    };
     if (drag.el) drag.el.classList.add("dragging");
     boardEl.setPointerCapture(e.pointerId);
   } else {
@@ -527,17 +552,29 @@ function onMove(e) {
   if (!drag) return;
   if (!drag.moved && (Math.abs(e.clientX - drag.x) > 4 || Math.abs(e.clientY - drag.y) > 4)) drag.moved = true;
   if (!drag.moved || !drag.el) return;
-  const rect = boardEl.getBoundingClientRect();
-  const size = rect.width / 8;
+  dragPoint = { x: e.clientX, y: e.clientY };
+  if (dragFrame) return;
+  dragFrame = requestAnimationFrame(updateDrag);
+}
+
+function updateDrag() {
+  dragFrame = null;
+  if (!drag || !dragPoint || !drag.el) return;
   drag.el.style.transition = "none";
-  drag.el.style.transform = `translate(${e.clientX - rect.left - size / 2}px, ${e.clientY - rect.top - size / 2}px)`;
-  setHover(pointToSquare(e.clientX, e.clientY));
+  drag.el.style.transform =
+    `translate3d(${dragPoint.x - drag.left - drag.size / 2}px, ${dragPoint.y - drag.top - drag.size / 2}px, 0)`;
+  setHover(pointToSquareWithin(dragPoint.x, dragPoint.y, drag.left, drag.top, drag.size));
 }
 
 function onUp(e) {
   if (!drag) return;
   const d = drag;
   drag = null;
+  dragPoint = null;
+  if (dragFrame) {
+    cancelAnimationFrame(dragFrame);
+    dragFrame = null;
+  }
   clearHover();
   if (d.el) d.el.classList.remove("dragging");
   if (!d.moved) return;
@@ -589,6 +626,7 @@ async function doMove(from, to, promotion) {
   const el = pieceAt[from];
   if (el) placePiece(el, to, true);
   if (humanCapture) playCaptureSound();
+  statusEl.textContent = "Engine is thinking...";
   try {
     const next = await api("/api/move", { game_id: state.game_id, from, to, promotion });
     const priorEvents = renderedEvents;
