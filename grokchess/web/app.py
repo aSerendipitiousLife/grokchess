@@ -76,17 +76,14 @@ _ENGINE_POOL: ProcessPoolExecutor | None = None
 _ENGINE_POOL_LOCK = threading.Lock()
 
 
-def _resolve_qualname(module_name: str, qualname: str):
-    module = __import__(module_name, fromlist=[qualname.split(".", 1)[0]])
-    value = module
-    for part in qualname.split("."):
-        value = getattr(value, part)
-    return value
-
-
-def _engine_worker(module_name: str, qualname: str, fen: str) -> dict:
+def _engine_worker(engine_name: str, engines_dir: str, fen: str) -> dict:
     try:
-        engine_cls = _resolve_qualname(module_name, qualname)
+        engine_cls = next(
+            (cls for cls in load_engines(engines_dir) if cls.name == engine_name),
+            None,
+        )
+        if engine_cls is None:
+            return {"error": f"unknown engine: {engine_name}"}
         board = chess.Board(fen)
         move = engine_cls().choose_move(board.copy())
         if not isinstance(move, chess.Move):
@@ -128,8 +125,8 @@ def _choose_move_isolated(engine_cls, board: chess.Board) -> chess.Move:
     global _ENGINE_POOL
     future = _engine_pool().submit(
         _engine_worker,
-        engine_cls.__module__,
-        engine_cls.__qualname__,
+        engine_cls.name,
+        ENGINES_DIR,
         board.fen(),
     )
     try:

@@ -4,12 +4,13 @@ import sys
 import time
 import types
 
+import chess
 import pytest
 from fastapi.testclient import TestClient
 
 import grokchess.metrics_db as metrics_db
 import grokchess.web.app as web_app
-from slow_web_engine import SlowWebEngine
+from grokchess.discovery import load_engines
 from grokchess.web.app import app
 
 metrics_db.DB_BACKEND = "sqlite"
@@ -206,10 +207,32 @@ def test_move_response_does_not_wait_for_metrics_write(monkeypatch):
     assert elapsed < 0.5
 
 
-def test_move_response_does_not_wait_for_engine_reply(monkeypatch):
-    monkeypatch.setitem(web_app._REGISTRY, SlowWebEngine.name, SlowWebEngine)
+def test_move_response_does_not_wait_for_engine_reply(monkeypatch, tmp_path):
+    engines_dir = tmp_path / "engines"
+    engine_dir = engines_dir / "slow"
+    engine_dir.mkdir(parents=True)
+    (engine_dir / "engine.py").write_text(
+        """
+import time
+import chess
+from grokchess.engine_base import Engine
+
+class SlowWebEngine(Engine):
+    name = "slow-web-engine"
+    author = "test"
+    league = "L0"
+
+    def choose_move(self, board):
+        time.sleep(0.75)
+        return next(iter(board.legal_moves))
+""",
+        encoding="utf-8",
+    )
+    slow_cls = load_engines(engines_dir)[0]
+    monkeypatch.setattr(web_app, "ENGINES_DIR", str(engines_dir))
+    monkeypatch.setitem(web_app._REGISTRY, slow_cls.name, slow_cls)
     client = TestClient(app)
-    started = client.post("/api/new", json={"engine": SlowWebEngine.name, "human_color": "white"})
+    started = client.post("/api/new", json={"engine": slow_cls.name, "human_color": "white"})
     assert started.status_code == 200
     state = started.json()
     move = state["legal_moves"][0]
@@ -236,3 +259,11 @@ def test_move_response_does_not_wait_for_engine_reply(monkeypatch):
 
     assert data["engine_pending"] is False
     assert len(data["move_events"]) >= 2
+
+
+def test_process_worker_can_run_discovered_engine():
+    ajack_cls = next(cls for cls in load_engines("engines") if cls.name == "ajack-berserker")
+
+    move = web_app._choose_move_isolated(ajack_cls, chess.Board())
+
+    assert move in chess.Board().legal_moves
