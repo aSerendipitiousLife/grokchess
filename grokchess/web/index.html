@@ -91,11 +91,13 @@
     aspect-ratio: 1 / 1;
     border-radius: 6px;
     overflow: hidden;
+    contain: layout paint;
     touch-action: none;
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
   }
   #squares, #pieces, #promo { position: absolute; inset: 0; }
   #squares, #pieces { pointer-events: none; }
+  #pieces { transform: translateZ(0); }
   #squares {
     display: grid;
     grid-template-columns: repeat(8, minmax(0, 1fr));
@@ -152,6 +154,7 @@
     background-position: center;
     filter: drop-shadow(0 2px 2px rgba(0,0,0,0.3));
     transform: translate3d(0, 0, 0);
+    backface-visibility: hidden;
     will-change: transform;
   }
   .piece.dragging {
@@ -331,6 +334,7 @@
 <script>
 const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"];
 const PIECE_URL = code => `/static/pieces/${code}.svg`;
+const MOVE_ANIMATION_MS = 260;
 
 let mode = "play";
 let state = null;
@@ -346,6 +350,8 @@ let renderedEvents = 0;
 let tournament = null;
 let tournamentJobTimer = null;
 let enginePollTimer = null;
+let delayedRenderTimer = null;
+let animationHoldUntil = 0;
 let watchGameIndex = 0;
 let watchFrameIndex = 0;
 let watchTimer = null;
@@ -451,7 +457,7 @@ function buildSquares() {
 
 function placePiece(el, sq, animate) {
   const { col, row } = squareToDisplay(sq);
-  el.style.transition = animate ? "transform 0.2s ease" : "none";
+  el.style.transition = animate ? `transform ${MOVE_ANIMATION_MS}ms cubic-bezier(0.22, 1, 0.36, 1)` : "none";
   el.style.transform = `translate3d(${col * 100}%, ${row * 100}%, 0)`;
 }
 
@@ -642,6 +648,25 @@ function stopEnginePolling() {
   enginePollTimer = null;
 }
 
+function stopDelayedRender() {
+  if (delayedRenderTimer) clearTimeout(delayedRenderTimer);
+  delayedRenderTimer = null;
+}
+
+function renderWhenAnimationReady(animate = null) {
+  const wait = animationHoldUntil - performance.now();
+  if (wait <= 0) {
+    stopDelayedRender();
+    render(animate);
+    return;
+  }
+  stopDelayedRender();
+  delayedRenderTimer = setTimeout(() => {
+    delayedRenderTimer = null;
+    render(animate);
+  }, wait);
+}
+
 function sameBoardState(a, b) {
   return a && b &&
     a.fen === b.fen &&
@@ -657,6 +682,15 @@ function applyPlayState(next, options = {}) {
   state = next;
   playState = next;
   renderedEvents = state.move_events.length;
+  const newEvents = state.move_events.slice(priorEvents);
+  const humanMove = newEvents.find(ev => ev.actor === "human");
+  const engineMove = newEvents.find(ev => ev.actor === "engine");
+  if (options.preserveHumanAnimation && humanMove && !engineMove && state.engine_pending) {
+    renderPlayStatus();
+    renderWhenAnimationReady(null);
+    scheduleEnginePoll();
+    return;
+  }
   if (options.skipUnchangedRender && visualUnchanged) {
     renderPlayStatus();
     if (state.engine_pending) scheduleEnginePoll();
@@ -664,13 +698,11 @@ function applyPlayState(next, options = {}) {
     return;
   }
   let animate = null;
-  const newEvents = state.move_events.slice(priorEvents);
-  const engineMove = newEvents.find(ev => ev.actor === "engine");
   if (engineMove) {
     animate = { from: engineMove.from, to: engineMove.to };
     if (engineMove.captured) playCaptureSound();
   }
-  render(animate);
+  renderWhenAnimationReady(animate);
   if (state.engine_pending) scheduleEnginePoll();
   else stopEnginePolling();
 }
@@ -694,14 +726,21 @@ async function doMove(from, to, promotion) {
   const humanCapture = moveWasCapture(from, to);
   const el = pieceAt[from];
   const capturedEl = pieceAt[to];
+  animationHoldUntil = performance.now() + MOVE_ANIMATION_MS;
   if (humanCapture && capturedEl) capturedEl.style.visibility = "hidden";
-  if (el) placePiece(el, to, true);
+  if (el) {
+    placePiece(el, to, true);
+    delete pieceAt[from];
+    pieceAt[to] = el;
+  }
   if (humanCapture) playCaptureSound();
   statusEl.textContent = "Engine is thinking...";
   try {
-    applyPlayState(await api("/api/move", { game_id: state.game_id, from, to, promotion }));
+    applyPlayState(await api("/api/move", { game_id: state.game_id, from, to, promotion }), { preserveHumanAnimation: true });
   } catch (err) {
     statusEl.textContent = "Error: " + err.message;
+    animationHoldUntil = 0;
+    stopDelayedRender();
     render();
   }
 }
@@ -723,6 +762,8 @@ async function newGame() {
   try {
     mode = "play";
     stopEnginePolling();
+    stopDelayedRender();
+    animationHoldUntil = 0;
     syncModeUi();
     selected = null;
     orientationOverride = null;
@@ -820,6 +861,7 @@ async function loadMetrics() {
 function showWatchGame(index) {
   if (!tournament || !tournament.games.length) return;
   stopEnginePolling();
+  stopDelayedRender();
   watchGameIndex = Math.max(0, Math.min(index, tournament.games.length - 1));
   watchFrameIndex = 0;
   renderWatchFrame(null);
@@ -965,6 +1007,8 @@ function setMode(nextMode) {
   selected = null;
   closePromotion();
   stopEnginePolling();
+  stopDelayedRender();
+  animationHoldUntil = 0;
   stopWatch();
   syncModeUi();
   if (mode === "play") {
