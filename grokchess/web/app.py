@@ -78,6 +78,13 @@ def _raise_database_error(exc: Exception) -> None:
 
 def _add_db_warning(game: dict, exc: Exception) -> None:
     warning = _database_detail(exc)
+    lock = game.get("lock")
+    if lock:
+        with lock:
+            warnings = game.setdefault("db_warnings", [])
+            if warning not in warnings:
+                warnings.append(warning)
+        return
     warnings = game.setdefault("db_warnings", [])
     if warning not in warnings:
         warnings.append(warning)
@@ -91,6 +98,31 @@ def _run_db_later(game: dict, work) -> None:
             _add_db_warning(game, exc)
 
     threading.Thread(target=runner, name="grokchess-metrics", daemon=True).start()
+
+
+def _queue_engine_reply(game: dict) -> None:
+    board = game["board"]
+    if (
+        game.get("engine_pending")
+        or game.get("forfeit")
+        or board.is_game_over(claim_draw=True)
+        or board.turn == game["human_color"]
+    ):
+        return
+    game["engine_pending"] = True
+
+    def runner() -> None:
+        with game["lock"]:
+            try:
+                _engine_reply(game)
+            finally:
+                game["engine_pending"] = False
+
+    # Give the browser a chance to paint the human move before CPU-heavy engines think.
+    timer = threading.Timer(0.05, runner)
+    timer.name = "grokchess-engine"
+    timer.daemon = True
+    timer.start()
 
 
 def _registry() -> dict[str, type]:
@@ -243,33 +275,35 @@ def _engine_reply(game: dict) -> None:
 
 def _state(game_id: str) -> dict:
     game = _GAMES[game_id]
-    board = game["board"]
-    status, reason, detail = _status(game)
-    legal = [
-        {
-            "from": chess.square_name(m.from_square),
-            "to": chess.square_name(m.to_square),
-            "uci": m.uci(),
-            "promotion": chess.piece_symbol(m.promotion) if m.promotion else None,
+    with game["lock"]:
+        board = game["board"]
+        status, reason, detail = _status(game)
+        legal = [
+            {
+                "from": chess.square_name(m.from_square),
+                "to": chess.square_name(m.to_square),
+                "uci": m.uci(),
+                "promotion": chess.piece_symbol(m.promotion) if m.promotion else None,
+            }
+            for m in board.legal_moves
+        ]
+        return {
+            "game_id": game_id,
+            "fen": board.fen(),
+            "turn": "white" if board.turn == chess.WHITE else "black",
+            "human_color": "white" if game["human_color"] == chess.WHITE else "black",
+            "engine": game["engine_name"],
+            "legal_moves": legal,
+            "last_move": game.get("last_move"),
+            "move_events": list(game.get("move_events", [])),
+            "check": board.is_check(),
+            "status": status,
+            "reason": reason,
+            "detail": detail,
+            "move_number": board.fullmove_number,
+            "engine_pending": bool(game.get("engine_pending")),
+            "warnings": list(game.get("db_warnings", [])),
         }
-        for m in board.legal_moves
-    ]
-    return {
-        "game_id": game_id,
-        "fen": board.fen(),
-        "turn": "white" if board.turn == chess.WHITE else "black",
-        "human_color": "white" if game["human_color"] == chess.WHITE else "black",
-        "engine": game["engine_name"],
-        "legal_moves": legal,
-        "last_move": game.get("last_move"),
-        "move_events": game.get("move_events", []),
-        "check": board.is_check(),
-        "status": status,
-        "reason": reason,
-        "detail": detail,
-        "move_number": board.fullmove_number,
-        "warnings": list(game.get("db_warnings", [])),
-    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -354,11 +388,14 @@ def new_game(req: NewGame):
         "db_game_id": db_game_id,
         "db_finished": False,
         "db_warnings": db_warnings,
+        "engine_pending": False,
+        "lock": threading.RLock(),
         "last_move": None,
         "move_events": [],
     }
     _GAMES[game_id] = game
-    _engine_reply(game)  # engine moves first if the human chose Black
+    with game["lock"]:
+        _queue_engine_reply(game)  # engine moves first if the human chose Black
     return _state(game_id)
 
 
@@ -367,19 +404,22 @@ def move(req: MoveReq):
     if req.game_id not in _GAMES:
         raise HTTPException(status_code=404, detail="unknown game_id")
     game = _GAMES[req.game_id]
-    status, _, _ = _status(game)
-    if status != "playing":
+    with game["lock"]:
+        status, _, _ = _status(game)
+        if status != "playing":
+            return _state(req.game_id)
+        if game.get("engine_pending"):
+            raise HTTPException(status_code=400, detail="engine is thinking")
+        board = game["board"]
+        if board.turn != game["human_color"]:
+            raise HTTPException(status_code=400, detail="not your turn")
+        chosen = _resolve_move(board, req.from_sq, req.to_sq, req.promotion)
+        if chosen is None:
+            raise HTTPException(status_code=400, detail=f"illegal move: {req.from_sq}{req.to_sq}")
+        _push_recorded_move(game, chosen, "human")
+        _finish_db_game_if_needed(game)
+        _queue_engine_reply(game)
         return _state(req.game_id)
-    board = game["board"]
-    if board.turn != game["human_color"]:
-        raise HTTPException(status_code=400, detail="not your turn")
-    chosen = _resolve_move(board, req.from_sq, req.to_sq, req.promotion)
-    if chosen is None:
-        raise HTTPException(status_code=400, detail=f"illegal move: {req.from_sq}{req.to_sq}")
-    _push_recorded_move(game, chosen, "human")
-    _engine_reply(game)
-    _finish_db_game_if_needed(game)
-    return _state(req.game_id)
 
 
 @app.get("/api/state/{game_id}")

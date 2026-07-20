@@ -9,11 +9,22 @@ from fastapi.testclient import TestClient
 
 import grokchess.metrics_db as metrics_db
 import grokchess.web.app as web_app
+from grokchess.engine_base import Engine
 from grokchess.web.app import app
 
 metrics_db.DB_BACKEND = "sqlite"
 metrics_db.DATABASE_URL = ""
 metrics_db._READY = False
+
+
+class SlowWebEngine(Engine):
+    name = "slow-web-engine"
+    author = "test"
+    league = "L0"
+
+    def choose_move(self, board):
+        time.sleep(0.75)
+        return next(iter(board.legal_moves))
 
 
 def test_tournament_job_completes():
@@ -203,3 +214,35 @@ def test_move_response_does_not_wait_for_metrics_write(monkeypatch):
 
     assert response.status_code == 200
     assert elapsed < 0.5
+
+
+def test_move_response_does_not_wait_for_engine_reply(monkeypatch):
+    monkeypatch.setitem(web_app._REGISTRY, SlowWebEngine.name, SlowWebEngine)
+    client = TestClient(app)
+    started = client.post("/api/new", json={"engine": SlowWebEngine.name, "human_color": "white"})
+    assert started.status_code == 200
+    state = started.json()
+    move = state["legal_moves"][0]
+
+    started_at = time.monotonic()
+    response = client.post(
+        "/api/move",
+        json={"game_id": state["game_id"], "from": move["from"], "to": move["to"]},
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert response.status_code == 200
+    data = response.json()
+    assert elapsed < 0.5
+    assert data["engine_pending"] is True
+    assert len(data["move_events"]) == 1
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        data = client.get(f"/api/state/{state['game_id']}").json()
+        if not data["engine_pending"]:
+            break
+        time.sleep(0.05)
+
+    assert data["engine_pending"] is False
+    assert len(data["move_events"]) >= 2

@@ -345,6 +345,7 @@ let pieceAt = {};
 let renderedEvents = 0;
 let tournament = null;
 let tournamentJobTimer = null;
+let enginePollTimer = null;
 let watchGameIndex = 0;
 let watchFrameIndex = 0;
 let watchTimer = null;
@@ -414,7 +415,7 @@ function targetsFrom(sq) {
 }
 
 function myTurn() {
-  return mode === "play" && state && state.status === "playing" && state.turn === state.human_color;
+  return mode === "play" && state && state.status === "playing" && !state.engine_pending && state.turn === state.human_color;
 }
 
 function render(animateMove = null) {
@@ -495,7 +496,7 @@ function renderPlayStatus() {
   const engine = state.engine;
   const warning = state.warnings && state.warnings.length ? ` | Metrics warning: ${state.warnings[0]}` : "";
   if (state.status === "playing") {
-    statusEl.textContent = state.turn === state.human_color ? "Your move" : `${engine} is thinking...`;
+    statusEl.textContent = state.engine_pending || state.turn !== state.human_color ? `${engine} is thinking...` : "Your move";
     turnEl.textContent = `You: ${state.human_color} | Engine: ${engine} | move ${state.move_number}${warning}`;
   } else {
     const outcome = { white_wins: "White wins", black_wins: "Black wins", draw: "Draw" }[state.status] || state.status;
@@ -636,6 +637,43 @@ function moveWasCapture(from, to) {
   return Boolean(pieces[to]);
 }
 
+function stopEnginePolling() {
+  if (enginePollTimer) clearTimeout(enginePollTimer);
+  enginePollTimer = null;
+}
+
+function applyPlayState(next) {
+  const priorEvents = renderedEvents;
+  state = next;
+  playState = next;
+  renderedEvents = state.move_events.length;
+  let animate = null;
+  const newEvents = state.move_events.slice(priorEvents);
+  const engineMove = newEvents.find(ev => ev.actor === "engine");
+  if (engineMove) {
+    animate = { from: engineMove.from, to: engineMove.to };
+    if (engineMove.captured) playCaptureSound();
+  }
+  render(animate);
+  if (state.engine_pending) scheduleEnginePoll();
+  else stopEnginePolling();
+}
+
+function scheduleEnginePoll() {
+  if (enginePollTimer || !state || mode !== "play") return;
+  enginePollTimer = setTimeout(pollEngineReply, 120);
+}
+
+async function pollEngineReply() {
+  enginePollTimer = null;
+  if (!state || mode !== "play" || !state.engine_pending) return;
+  try {
+    applyPlayState(await api(`/api/state/${state.game_id}`));
+  } catch (err) {
+    statusEl.textContent = "Error: " + err.message;
+  }
+}
+
 async function doMove(from, to, promotion) {
   const humanCapture = moveWasCapture(from, to);
   const el = pieceAt[from];
@@ -643,19 +681,7 @@ async function doMove(from, to, promotion) {
   if (humanCapture) playCaptureSound();
   statusEl.textContent = "Engine is thinking...";
   try {
-    const next = await api("/api/move", { game_id: state.game_id, from, to, promotion });
-    const priorEvents = renderedEvents;
-    state = next;
-    playState = next;
-    renderedEvents = state.move_events.length;
-    let animate = null;
-    const newEvents = state.move_events.slice(priorEvents);
-    const engineMove = newEvents.find(ev => ev.actor === "engine");
-    if (engineMove) {
-      animate = { from: engineMove.from, to: engineMove.to };
-      if (engineMove.captured) playCaptureSound();
-    }
-    render(animate);
+    applyPlayState(await api("/api/move", { game_id: state.game_id, from, to, promotion }));
   } catch (err) {
     statusEl.textContent = "Error: " + err.message;
     render();
@@ -678,22 +704,19 @@ async function api(path, body) {
 async function newGame() {
   try {
     mode = "play";
+    stopEnginePolling();
     syncModeUi();
     selected = null;
     orientationOverride = null;
     closePromotion();
     renderedEvents = 0;
-    state = await api("/api/new", {
+    const next = await api("/api/new", {
       engine: document.getElementById("engine").value,
       human_color: document.getElementById("color").value,
       player_id: player ? player.id : null,
       player_name: player ? player.name : document.getElementById("player-name").value,
     });
-    playState = state;
-    renderedEvents = state.move_events.length;
-    let animate = null;
-    if (state.last_move) animate = { from: state.last_move.slice(0, 2), to: state.last_move.slice(2, 4) };
-    render(animate);
+    applyPlayState(next);
   } catch (err) {
     statusEl.textContent = "Error: " + err.message;
   }
@@ -778,6 +801,7 @@ async function loadMetrics() {
 
 function showWatchGame(index) {
   if (!tournament || !tournament.games.length) return;
+  stopEnginePolling();
   watchGameIndex = Math.max(0, Math.min(index, tournament.games.length - 1));
   watchFrameIndex = 0;
   renderWatchFrame(null);
@@ -922,12 +946,14 @@ function setMode(nextMode) {
   mode = nextMode;
   selected = null;
   closePromotion();
+  stopEnginePolling();
   stopWatch();
   syncModeUi();
   if (mode === "play") {
     orientationOverride = null;
     state = playState;
     render();
+    if (state && state.engine_pending) scheduleEnginePoll();
   } else if (mode === "metrics") {
     loadMetrics().catch(err => { statusEl.textContent = "Error: " + err.message; });
     if (!state) buildSquares();
