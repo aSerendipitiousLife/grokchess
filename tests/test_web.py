@@ -2,8 +2,10 @@
 
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
+import grokchess.metrics_db as metrics_db
 from grokchess.web.app import app
 
 
@@ -52,3 +54,15 @@ def test_login_and_metrics_summary():
     assert summary.status_code == 200
     data = summary.json()
     assert any(engine["games"] > 0 for engine in data["engines"])
+
+
+def test_postgres_backend_requires_database_url(monkeypatch):
+    monkeypatch.setattr(metrics_db, "DB_BACKEND", "postgres")
+    monkeypatch.setattr(metrics_db, "DATABASE_URL", "")
+    monkeypatch.setattr(metrics_db, "_READY", False)
+
+    with pytest.raises(RuntimeError, match="GROKCHESS_DATABASE_URL"):
+        metrics_db.init_db()
+
+    monkeypatch.setattr(metrics_db, "DB_BACKEND", "sqlite")
+    monkeypatch.setattr(metrics_db, "_READY", False)

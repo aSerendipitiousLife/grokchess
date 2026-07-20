@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 # The web board needs a couple more packages; the core arena does not.
 web = ["fastapi>=0.110", "uvicorn>=0.29"]
+postgres = ["psycopg[binary]>=3.2"]
 dev = ["pytest>=8.0", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 
 [project.scripts]

@@ -1,4 +1,8 @@
-"""SQLite-backed game and move metrics for grokchess."""
+"""Game and move metrics storage for grokchess.
+
+SQLite is the default local backend. Set ``GROKCHESS_DB_BACKEND=postgres`` and
+``GROKCHESS_DATABASE_URL`` to write the same metrics into Supabase/Postgres.
+"""
 
 from __future__ import annotations
 
@@ -14,12 +18,37 @@ import chess
 from .arena import GameResult
 
 DB_PATH = Path(os.environ.get("GROKCHESS_DB_PATH", "data/grokchess.sqlite"))
+DATABASE_URL = os.environ.get("GROKCHESS_DATABASE_URL", "")
+DB_BACKEND = os.environ.get(
+    "GROKCHESS_DB_BACKEND", "postgres" if DATABASE_URL else "sqlite"
+).lower()
 
 _LOCK = threading.Lock()
 _READY = False
 
 
-def _connect() -> sqlite3.Connection:
+def _is_postgres() -> bool:
+    return DB_BACKEND in {"postgres", "postgresql", "supabase"}
+
+
+def _placeholder() -> str:
+    return "%s" if _is_postgres() else "?"
+
+
+def _connect():
+    if _is_postgres():
+        if not DATABASE_URL:
+            raise RuntimeError("GROKCHESS_DATABASE_URL is required for Postgres metrics")
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError(
+                "Postgres metrics require `psycopg`. Install with "
+                '`uv sync --extra dev --extra postgres`.'
+            ) from exc
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -32,53 +61,111 @@ def init_db() -> None:
     if _READY:
         return
     with _LOCK, _connect() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS players (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                created_at REAL NOT NULL
-            );
+        if _is_postgres():
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS players (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS games (
+                    id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    white_name TEXT NOT NULL,
+                    white_kind TEXT NOT NULL,
+                    white_player_id TEXT REFERENCES players(id),
+                    black_name TEXT NOT NULL,
+                    black_kind TEXT NOT NULL,
+                    black_player_id TEXT REFERENCES players(id),
+                    result TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    started_at DOUBLE PRECISION NOT NULL,
+                    finished_at DOUBLE PRECISION,
+                    ply_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS moves (
+                    id BIGSERIAL PRIMARY KEY,
+                    game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+                    ply INTEGER NOT NULL,
+                    actor_name TEXT NOT NULL,
+                    actor_kind TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    uci TEXT NOT NULL,
+                    piece TEXT NOT NULL,
+                    captured TEXT,
+                    is_capture INTEGER NOT NULL,
+                    is_check INTEGER NOT NULL,
+                    is_checkmate INTEGER NOT NULL,
+                    fen_after TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_moves_actor ON moves(actor_kind, actor_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_games_white ON games(white_kind, white_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_games_black ON games(black_kind, black_name)")
+        else:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS players (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at REAL NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS games (
-                id TEXT PRIMARY KEY,
-                mode TEXT NOT NULL,
-                white_name TEXT NOT NULL,
-                white_kind TEXT NOT NULL,
-                white_player_id TEXT REFERENCES players(id),
-                black_name TEXT NOT NULL,
-                black_kind TEXT NOT NULL,
-                black_player_id TEXT REFERENCES players(id),
-                result TEXT NOT NULL DEFAULT '',
-                reason TEXT NOT NULL DEFAULT '',
-                detail TEXT NOT NULL DEFAULT '',
-                started_at REAL NOT NULL,
-                finished_at REAL,
-                ply_count INTEGER NOT NULL DEFAULT 0
-            );
+                CREATE TABLE IF NOT EXISTS games (
+                    id TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    white_name TEXT NOT NULL,
+                    white_kind TEXT NOT NULL,
+                    white_player_id TEXT REFERENCES players(id),
+                    black_name TEXT NOT NULL,
+                    black_kind TEXT NOT NULL,
+                    black_player_id TEXT REFERENCES players(id),
+                    result TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    started_at REAL NOT NULL,
+                    finished_at REAL,
+                    ply_count INTEGER NOT NULL DEFAULT 0
+                );
 
-            CREATE TABLE IF NOT EXISTS moves (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-                ply INTEGER NOT NULL,
-                actor_name TEXT NOT NULL,
-                actor_kind TEXT NOT NULL,
-                color TEXT NOT NULL,
-                uci TEXT NOT NULL,
-                piece TEXT NOT NULL,
-                captured TEXT,
-                is_capture INTEGER NOT NULL,
-                is_check INTEGER NOT NULL,
-                is_checkmate INTEGER NOT NULL,
-                fen_after TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS moves (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+                    ply INTEGER NOT NULL,
+                    actor_name TEXT NOT NULL,
+                    actor_kind TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    uci TEXT NOT NULL,
+                    piece TEXT NOT NULL,
+                    captured TEXT,
+                    is_capture INTEGER NOT NULL,
+                    is_check INTEGER NOT NULL,
+                    is_checkmate INTEGER NOT NULL,
+                    fen_after TEXT NOT NULL
+                );
 
-            CREATE INDEX IF NOT EXISTS idx_moves_actor ON moves(actor_kind, actor_name);
-            CREATE INDEX IF NOT EXISTS idx_games_white ON games(white_kind, white_name);
-            CREATE INDEX IF NOT EXISTS idx_games_black ON games(black_kind, black_name);
-            """
-        )
+                CREATE INDEX IF NOT EXISTS idx_moves_actor ON moves(actor_kind, actor_name);
+                CREATE INDEX IF NOT EXISTS idx_games_white ON games(white_kind, white_name);
+                CREATE INDEX IF NOT EXISTS idx_games_black ON games(black_kind, black_name);
+                """
+            )
         _READY = True
+
+
+def _fetchone(conn, sql: str, params=()):
+    row = conn.execute(sql, params).fetchone()
+    return dict(row) if row is not None else None
 
 
 def login_player(name: str) -> dict:
@@ -86,16 +173,17 @@ def login_player(name: str) -> dict:
     clean = " ".join(name.strip().split())
     if not clean:
         raise ValueError("player name is required")
+    ph = _placeholder()
     with _LOCK, _connect() as conn:
-        row = conn.execute("SELECT id, name FROM players WHERE lower(name) = lower(?)", (clean,)).fetchone()
+        row = _fetchone(conn, f"SELECT id, name FROM players WHERE lower(name) = lower({ph})", (clean,))
         if row is None:
             player_id = uuid.uuid4().hex[:12]
             conn.execute(
-                "INSERT INTO players (id, name, created_at) VALUES (?, ?, ?)",
+                f"INSERT INTO players (id, name, created_at) VALUES ({ph}, {ph}, {ph})",
                 (player_id, clean, time.time()),
             )
-            row = conn.execute("SELECT id, name FROM players WHERE id = ?", (player_id,)).fetchone()
-        return dict(row)
+            row = _fetchone(conn, f"SELECT id, name FROM players WHERE id = {ph}", (player_id,))
+        return row
 
 
 def start_game(
@@ -110,14 +198,15 @@ def start_game(
 ) -> str:
     init_db()
     game_id = uuid.uuid4().hex[:12]
+    ph = _placeholder()
     with _LOCK, _connect() as conn:
         conn.execute(
-            """
+            f"""
             INSERT INTO games (
                 id, mode, white_name, white_kind, white_player_id,
                 black_name, black_kind, black_player_id, started_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
             """,
             (
                 game_id,
@@ -158,14 +247,15 @@ def record_move(
         "captured": captured_piece.symbol() if captured_piece else None,
         "actor": actor_name,
     }
+    ph = _placeholder()
     with _LOCK, _connect() as conn:
         conn.execute(
-            """
+            f"""
             INSERT INTO moves (
                 game_id, ply, actor_name, actor_kind, color, uci, piece, captured,
                 is_capture, is_check, is_checkmate, fen_after
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
             """,
             (
                 game_id,
@@ -182,18 +272,19 @@ def record_move(
                 board_after.fen(),
             ),
         )
-        conn.execute("UPDATE games SET ply_count = ply_count + 1 WHERE id = ?", (game_id,))
+        conn.execute(f"UPDATE games SET ply_count = ply_count + 1 WHERE id = {ph}", (game_id,))
     return event
 
 
 def finish_game(game_id: str, result: str, reason: str, detail: str = "") -> None:
     init_db()
+    ph = _placeholder()
     with _LOCK, _connect() as conn:
         conn.execute(
-            """
+            f"""
             UPDATE games
-            SET result = ?, reason = ?, detail = ?, finished_at = COALESCE(finished_at, ?)
-            WHERE id = ?
+            SET result = {ph}, reason = {ph}, detail = {ph}, finished_at = COALESCE(finished_at, {ph})
+            WHERE id = {ph}
             """,
             (result, reason, detail, time.time(), game_id),
         )
@@ -220,40 +311,45 @@ def record_result_game(result: GameResult, *, mode: str = "tournament") -> str:
 def metrics_summary() -> dict:
     init_db()
     with _LOCK, _connect() as conn:
-        games = conn.execute(
-            """
-            WITH participants AS (
-                SELECT id, white_name AS name, white_kind AS kind, result, ply_count,
-                       CASE WHEN result = '1-0' THEN 1 ELSE 0 END AS win,
-                       CASE WHEN result = '0-1' THEN 1 ELSE 0 END AS loss,
-                       CASE WHEN result = '1/2-1/2' THEN 1 ELSE 0 END AS draw
-                FROM games WHERE result != ''
-                UNION ALL
-                SELECT id, black_name AS name, black_kind AS kind, result, ply_count,
-                       CASE WHEN result = '0-1' THEN 1 ELSE 0 END AS win,
-                       CASE WHEN result = '1-0' THEN 1 ELSE 0 END AS loss,
-                       CASE WHEN result = '1/2-1/2' THEN 1 ELSE 0 END AS draw
-                FROM games WHERE result != ''
-            )
-            SELECT kind, name, COUNT(*) AS games, SUM(win) AS wins, SUM(loss) AS losses,
-                   SUM(draw) AS draws, ROUND(AVG(ply_count), 1) AS avg_plies
-            FROM participants
-            GROUP BY kind, name
-            """
-        ).fetchall()
-        moves = conn.execute(
-            """
-            SELECT actor_kind AS kind, actor_name AS name, COUNT(*) AS moves,
-                   SUM(is_capture) AS captures, SUM(is_check) AS checks,
-                   SUM(is_checkmate) AS checkmates
-            FROM moves
-            GROUP BY actor_kind, actor_name
-            """
-        ).fetchall()
+        games = [
+            dict(row)
+            for row in conn.execute(
+                """
+                WITH participants AS (
+                    SELECT id, white_name AS name, white_kind AS kind, result, ply_count,
+                           CASE WHEN result = '1-0' THEN 1 ELSE 0 END AS win,
+                           CASE WHEN result = '0-1' THEN 1 ELSE 0 END AS loss,
+                           CASE WHEN result = '1/2-1/2' THEN 1 ELSE 0 END AS draw
+                    FROM games WHERE result != ''
+                    UNION ALL
+                    SELECT id, black_name AS name, black_kind AS kind, result, ply_count,
+                           CASE WHEN result = '0-1' THEN 1 ELSE 0 END AS win,
+                           CASE WHEN result = '1-0' THEN 1 ELSE 0 END AS loss,
+                           CASE WHEN result = '1/2-1/2' THEN 1 ELSE 0 END AS draw
+                    FROM games WHERE result != ''
+                )
+                SELECT kind, name, COUNT(*) AS games, SUM(win) AS wins, SUM(loss) AS losses,
+                       SUM(draw) AS draws, ROUND(AVG(ply_count), 1) AS avg_plies
+                FROM participants
+                GROUP BY kind, name
+                """
+            ).fetchall()
+        ]
+        moves = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT actor_kind AS kind, actor_name AS name, COUNT(*) AS moves,
+                       SUM(is_capture) AS captures, SUM(is_check) AS checks,
+                       SUM(is_checkmate) AS checkmates
+                FROM moves
+                GROUP BY actor_kind, actor_name
+                """
+            ).fetchall()
+        ]
 
     by_key = {}
-    for row in games:
-        item = dict(row)
+    for item in games:
         item.update({"moves": 0, "captures": 0, "checks": 0, "checkmates": 0})
         by_key[(item["kind"], item["name"])] = item
     for row in moves:

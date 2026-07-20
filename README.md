@@ -64,6 +64,28 @@ The web app records game and tournament metrics in a local SQLite database at
 game if you want your human moves tracked; tournament simulations automatically
 track engine metrics.
 
+For shared metrics, point the app at Supabase/Postgres instead:
+
+```powershell
+uv sync --extra dev --extra postgres
+$env:GROKCHESS_DB_BACKEND="postgres"
+$env:GROKCHESS_DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/postgres?sslmode=require"
+& ".\.venv\Scripts\python.exe" -m grokchess.desktop
+```
+
+On Linux/macOS:
+
+```bash
+uv sync --extra dev --extra postgres
+export GROKCHESS_DB_BACKEND=postgres
+export GROKCHESS_DATABASE_URL='postgresql://USER:PASSWORD@HOST:PORT/postgres?sslmode=require'
+./.venv/bin/python -m grokchess.desktop
+```
+
+Use a normal app database user for grokchess writes. For Grafana, create a
+separate read-only Postgres user and connect Grafana to the same Supabase
+database.
+
 ## Write your own engine
 
 New to pull requests? [`CONTRIBUTING.md`](CONTRIBUTING.md) walks through the
