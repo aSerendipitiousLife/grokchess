@@ -12,7 +12,10 @@ Run it with:  python -m grokchess.web   (from the repo root)
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, TimeoutError
+from concurrent.futures.process import BrokenProcessPool
 import itertools
+import multiprocessing
 import os
 import threading
 import uuid
@@ -24,7 +27,14 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from ..arena import DEFAULT_TIME_LIMIT, MoveTimeout, _natural_reason, call_with_time_limit, play_game
+from ..arena import (
+    DEFAULT_TIME_LIMIT,
+    TIME_LIMIT_SLACK,
+    MoveTimeout,
+    _natural_reason,
+    call_with_time_limit,
+    play_game,
+)
 from ..discovery import load_engines
 from ..metrics_db import (
     finish_game,
@@ -38,6 +48,8 @@ from ..tournament import Standing, _tally
 
 TIME_LIMIT = float(os.environ.get("GROKCHESS_TIME_LIMIT", DEFAULT_TIME_LIMIT))
 ENGINES_DIR = os.environ.get("GROKCHESS_ENGINES_DIR", "engines")
+WEB_ENGINE_BACKEND = os.environ.get("GROKCHESS_WEB_ENGINE_BACKEND", "process").lower()
+WEB_ENGINE_STARTUP_GRACE = float(os.environ.get("GROKCHESS_WEB_ENGINE_STARTUP_GRACE", "3.0"))
 MAX_GAMES = 50  # in-memory game cap; oldest games are evicted past this
 MAX_TOURNAMENTS = 10
 
@@ -60,6 +72,87 @@ _GAMES: dict[str, dict] = {}
 # tournament_id -> job state
 _TOURNAMENTS: dict[str, dict] = {}
 _TOURNAMENT_LOCK = threading.Lock()
+_ENGINE_POOL: ProcessPoolExecutor | None = None
+_ENGINE_POOL_LOCK = threading.Lock()
+
+
+def _resolve_qualname(module_name: str, qualname: str):
+    module = __import__(module_name, fromlist=[qualname.split(".", 1)[0]])
+    value = module
+    for part in qualname.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def _engine_worker(module_name: str, qualname: str, fen: str) -> dict:
+    try:
+        engine_cls = _resolve_qualname(module_name, qualname)
+        board = chess.Board(fen)
+        move = engine_cls().choose_move(board.copy())
+        if not isinstance(move, chess.Move):
+            return {"error": f"returned non-move: {move!r}"}
+        return {"uci": move.uci()}
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent process
+        return {"error": repr(exc)}
+
+
+def _engine_noop() -> bool:
+    return True
+
+
+def _engine_pool() -> ProcessPoolExecutor:
+    global _ENGINE_POOL
+    with _ENGINE_POOL_LOCK:
+        if _ENGINE_POOL is None:
+            _ENGINE_POOL = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+        return _ENGINE_POOL
+
+
+def _warm_engine_pool_later() -> None:
+    if WEB_ENGINE_BACKEND != "process":
+        return
+
+    def warm() -> None:
+        try:
+            _engine_pool().submit(_engine_noop).result(WEB_ENGINE_STARTUP_GRACE)
+        except Exception:
+            pass
+
+    threading.Thread(target=warm, name="grokchess-engine-warmup", daemon=True).start()
+
+
+def _choose_move_isolated(engine_cls, board: chess.Board) -> chess.Move:
+    global _ENGINE_POOL
+    future = _engine_pool().submit(
+        _engine_worker,
+        engine_cls.__module__,
+        engine_cls.__qualname__,
+        board.fen(),
+    )
+    try:
+        payload = future.result(TIME_LIMIT + TIME_LIMIT_SLACK + WEB_ENGINE_STARTUP_GRACE)
+    except TimeoutError as exc:
+        future.cancel()
+        raise MoveTimeout(f"exceeded {TIME_LIMIT:.3f}s")
+    except BrokenProcessPool:
+        with _ENGINE_POOL_LOCK:
+            if _ENGINE_POOL is not None:
+                _ENGINE_POOL.shutdown(wait=False, cancel_futures=True)
+            _ENGINE_POOL = None
+        raise
+    if "error" in payload:
+        raise RuntimeError(payload["error"])
+    return chess.Move.from_uci(payload["uci"])
+
+
+def _choose_engine_move(engine_cls, board: chess.Board) -> chess.Move:
+    if WEB_ENGINE_BACKEND == "process":
+        return _choose_move_isolated(engine_cls, board)
+    move, _ = call_with_time_limit(lambda: engine_cls().choose_move(board.copy()), TIME_LIMIT)
+    return move
 
 
 def _database_detail(exc: Exception) -> str:
@@ -101,6 +194,46 @@ def _run_db_later(game: dict, work) -> None:
 
 
 def _queue_engine_reply(game: dict) -> None:
+    def runner() -> None:
+        with game["lock"]:
+            board = game["board"]
+            if (
+                game.get("forfeit")
+                or board.is_game_over(claim_draw=True)
+                or board.turn == game["human_color"]
+            ):
+                game["engine_pending"] = False
+                return
+            board_snapshot = board.copy()
+            engine_cls = type(game["engine"])
+            engine_name = game["engine_name"]
+
+        try:
+            move = _choose_engine_move(engine_cls, board_snapshot)
+            error = None
+        except MoveTimeout as exc:
+            move = None
+            error = ("timeout", str(exc))
+        except Exception as exc:  # noqa: BLE001 - engine bug forfeits
+            move = None
+            error = ("engine_error", repr(exc))
+
+        with game["lock"]:
+            board = game["board"]
+            try:
+                if error is not None:
+                    status, detail = error
+                    game["forfeit"] = (_human_wins_status(game), status, f"{engine_name}: {detail}")
+                    _finish_db_game_if_needed(game)
+                    return
+                if not isinstance(move, chess.Move) or move not in board.legal_moves:
+                    game["forfeit"] = (_human_wins_status(game), "illegal_move", str(move))
+                    _finish_db_game_if_needed(game)
+                    return
+                _push_recorded_move(game, move, "engine")
+            finally:
+                game["engine_pending"] = False
+
     board = game["board"]
     if (
         game.get("engine_pending")
@@ -110,13 +243,6 @@ def _queue_engine_reply(game: dict) -> None:
     ):
         return
     game["engine_pending"] = True
-
-    def runner() -> None:
-        with game["lock"]:
-            try:
-                _engine_reply(game)
-            finally:
-                game["engine_pending"] = False
 
     # Give the browser a chance to paint the human move before CPU-heavy engines think.
     timer = threading.Timer(0.05, runner)
@@ -246,33 +372,6 @@ def _finish_db_game_if_needed(game: dict) -> None:
         game["db_finished"] = True
 
 
-def _engine_reply(game: dict) -> None:
-    """If it's the engine's turn, let it move (or forfeit on error/timeout)."""
-    board = game["board"]
-    if game.get("forfeit") or board.is_game_over(claim_draw=True):
-        return
-    if board.turn == game["human_color"]:
-        return
-    engine = game["engine"]
-    try:
-        move, _ = call_with_time_limit(
-            lambda: engine.choose_move(board.copy()), TIME_LIMIT
-        )
-    except MoveTimeout as exc:
-        game["forfeit"] = (_human_wins_status(game), "timeout", str(exc))
-        _finish_db_game_if_needed(game)
-        return
-    except Exception as exc:  # noqa: BLE001 - engine bug forfeits
-        game["forfeit"] = (_human_wins_status(game), "engine_error", repr(exc))
-        _finish_db_game_if_needed(game)
-        return
-    if not isinstance(move, chess.Move) or move not in board.legal_moves:
-        game["forfeit"] = (_human_wins_status(game), "illegal_move", str(move))
-        _finish_db_game_if_needed(game)
-        return
-    _push_recorded_move(game, move, "engine")
-
-
 def _state(game_id: str) -> dict:
     game = _GAMES[game_id]
     with game["lock"]:
@@ -394,6 +493,7 @@ def new_game(req: NewGame):
         "move_events": [],
     }
     _GAMES[game_id] = game
+    _warm_engine_pool_later()
     with game["lock"]:
         _queue_engine_reply(game)  # engine moves first if the human chose Black
     return _state(game_id)

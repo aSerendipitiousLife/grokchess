@@ -9,22 +9,12 @@ from fastapi.testclient import TestClient
 
 import grokchess.metrics_db as metrics_db
 import grokchess.web.app as web_app
-from grokchess.engine_base import Engine
+from slow_web_engine import SlowWebEngine
 from grokchess.web.app import app
 
 metrics_db.DB_BACKEND = "sqlite"
 metrics_db.DATABASE_URL = ""
 metrics_db._READY = False
-
-
-class SlowWebEngine(Engine):
-    name = "slow-web-engine"
-    author = "test"
-    league = "L0"
-
-    def choose_move(self, board):
-        time.sleep(0.75)
-        return next(iter(board.legal_moves))
 
 
 def test_tournament_job_completes():
